@@ -46,6 +46,18 @@ var KNOWN_SUPPLIERS = [
   'billing.energyaustraliaonline.com.au'
 ];
 
+/**
+ * Suppliers who send invoices as Excel files. Their .xlsx/.xls attachments
+ * are converted to PDF (via a temporary Google Drive copy, deleted straight
+ * after) and then flow through the normal pipeline - triage, classify,
+ * forward - exactly like a PDF. Listed senders ONLY: a spreadsheet from
+ * anyone else (pricelists, cutting lists) is never converted or read.
+ * REQUIRES the Drive API advanced service: Editor > Services > + > Drive API.
+ */
+var XLSX_INVOICE_SUPPLIERS = [
+  // 'supplierdomain.com.au',
+];
+
 /** Senders that never send statements. */
 var IGNORE_SENDERS = [
   'noreply@google.com',
@@ -492,11 +504,18 @@ function processMailbox(user, after, before, opts, budget, stats, discovered,
   // other Top Cab address.
   var notOurs = OUR_DOMAINS.map(function (d) { return ' -from:' + d; }).join('') +
                 MAILBOXES.map(function (m) { return ' -from:' + m; }).join('');
-  var base = 'has:attachment filename:pdf -in:sent -in:drafts -in:trash' +
-             ' -in:chats -from:me' + notOurs;
+  var base0 = 'has:attachment -in:sent -in:drafts -in:trash' +
+              ' -in:chats -from:me' + notOurs;
+  var base = base0 + ' filename:pdf';
 
   var suppliers = activeSuppliers();
   var queries = [];
+  if (XLSX_INVOICE_SUPPLIERS.length) {
+    queries.push(base0 + ' filename:(xlsx OR xls)' +
+                 ' from:(' + XLSX_INVOICE_SUPPLIERS.join(' OR ') + ')' +
+                 ' -{' + NEGATIVE_KEYWORDS.join(' ') + '}' +
+                 dateRange + notProcessed);
+  }
   if (suppliers.length) {
     queries.push(base + ' from:(' + suppliers.join(' OR ') + ')' +
                  ' -{' + NEGATIVE_KEYWORDS.join(' ') + '}' +
@@ -579,8 +598,13 @@ function handleMessage(user, messageId, opts, budget, discovered, reviewRows,
   }
 
   // 3. No real PDF attached = nothing to file or forward, whatever the
-  //    text says. Checked BEFORE any classification runs.
+  //    text says. Checked BEFORE any classification runs. Spreadsheets
+  //    count only for suppliers explicitly listed as sending Excel invoices.
   var parts = findPdfParts(msg.payload);
+  var msgDomain = senderDomain(from);
+  if (msgDomain && XLSX_INVOICE_SUPPLIERS.indexOf(msgDomain) !== -1) {
+    parts = parts.concat(findExcelParts(msg.payload));
+  }
   Logger.log('  attachments that qualify: ' + parts.length);
   if (!parts.length) {
     Logger.log('  SKIP: no attached PDF of a usable size');
@@ -625,7 +649,11 @@ function handleMessage(user, messageId, opts, budget, discovered, reviewRows,
   }
 
   parts.forEach(function (part) {
-    var name = part.filename || 'unnamed.pdf';
+    var rawName = part.filename || 'unnamed.pdf';
+    var isExcel = /\.xlsx?$/i.test(rawName);
+    // Downstream (classify, Hubdoc, Dropbox, ledger) always sees the
+    // converted PDF's name, so replays stay consistent.
+    var name = isExcel ? rawName.replace(/\.xlsx?$/i, '.pdf') : rawName;
     var size = Number((part.body && part.body.size) || 0);
 
     if (size > MAX_PDF_MB * 1024 * 1024) {
@@ -671,6 +699,10 @@ function handleMessage(user, messageId, opts, budget, discovered, reviewRows,
     }
 
     var bytes = getAttachmentBytes(user, messageId, part);
+    if (isExcel) {
+      Logger.log('  converting ' + rawName + ' to PDF');
+      bytes = convertExcelToPdf(bytes, rawName, part.mimeType);
+    }
 
     var verdict;
     if (verdictFromEmail) {
@@ -933,6 +965,58 @@ function getAttachmentBytes(user, messageId, part) {
   var res = gmailApi(user, 'GET', 'messages/' + messageId +
                      '/attachments/' + part.body.attachmentId);
   return Utilities.base64DecodeWebSafe(res.data);
+}
+
+/**
+ * Excel attachments, same gates as findPdfParts. Only called for senders
+ * in XLSX_INVOICE_SUPPLIERS.
+ */
+function findExcelParts(payload) {
+  var found = [];
+  (function walk(part) {
+    if (!part) return;
+    var name = part.filename || '';
+    if (name && /\.xlsx?$/i.test(name) && part.body && part.body.attachmentId) {
+      var size = Number((part.body && part.body.size) || 0);
+      if (size && size < MIN_PDF_BYTES) {
+        Logger.log('  ignoring tiny spreadsheet: ' + name);
+      } else if (size > MAX_PDF_MB * 1024 * 1024) {
+        Logger.log('  ignoring oversized spreadsheet: ' + name);
+      } else {
+        found.push(part);
+      }
+    }
+    (part.parts || []).forEach(walk);
+  })(payload);
+  return found;
+}
+
+/**
+ * Spreadsheet -> PDF via a temporary Google Sheet in the script owner's
+ * Drive, deleted immediately, success or fail. Needs the Drive API advanced
+ * service enabled (Editor > Services > + > Drive API) - without it this
+ * throws and the message lands in Needs-review, which is the right failure.
+ */
+function convertExcelToPdf(bytes, name, mimeType) {
+  var blob = Utilities.newBlob(bytes,
+      mimeType || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      name);
+  var file = Drive.Files.insert({ title: 'tmp-invoice-convert ' + name },
+                                blob, { convert: true });
+  try {
+    var res = UrlFetchApp.fetch(
+        'https://docs.google.com/spreadsheets/d/' + file.id +
+        '/export?format=pdf&portrait=true&fitw=true&gridlines=false',
+        { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+          muteHttpExceptions: true });
+    if (res.getResponseCode() !== 200) {
+      throw new Error('Spreadsheet PDF export failed (' + res.getResponseCode() +
+                      ') for ' + name);
+    }
+    return res.getContent();
+  } finally {
+    try { Drive.Files.remove(file.id); } catch (e) {}
+  }
 }
 
 /** Returns true if #split was applied. */
