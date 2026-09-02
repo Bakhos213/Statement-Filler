@@ -160,8 +160,14 @@ var PDF_MARGIN_MS  = 90 * 1000;
 /** Where problems and summaries get emailed. */
 var ALERT_EMAIL = 'billy@topcabjoinery.com.au';
 
-/** Only email when something needs you, not after every quiet run. */
+/** Only email when something needs you, not after every quiet day. */
 var EMAIL_ONLY_WHEN_NOTEWORTHY = true;
+
+/**
+ * Hour (Sydney time, 24h) the single nightly summary email goes out.
+ * Runs during the day queue their results silently; nothing emails per run.
+ */
+var DIGEST_HOUR = 20;
 
 var GMAIL_SCOPES = 'https://www.googleapis.com/auth/gmail.modify ' +
                    'https://www.googleapis.com/auth/gmail.send';
@@ -298,7 +304,8 @@ function pauseEverything() {
 function resumeEverything() {
   PropertiesService.getScriptProperties().deleteProperty('PAUSED');
   installTrigger();
-  Logger.log('Resumed - hourly runs are back on.');
+  installDigestTrigger();
+  Logger.log('Resumed - hourly runs and the nightly digest are back on.');
 }
 
 // ---------------------------------------------------------------- main loop
@@ -387,7 +394,7 @@ function processRangeInner(after, before, opts) {
     if (!opts.dryRun) scheduleFollowUp(after, before);
   }
 
-  if (!opts.dryRun) sendDigest(stats, report);
+  if (!opts.dryRun) queueDigest(stats, report);
 }
 
 // ---------------------------------------------------------------- self-running
@@ -427,69 +434,127 @@ function clearFollowUps() {
 
 // ---------------------------------------------------------------- email digest
 
-function sendDigest(stats, report) {
-  var noteworthy = report.filed.length || report.newSuppliers.length ||
-                   report.problems.length || stats.review ||
-                   report.hubdoc.length;
-  if (EMAIL_ONLY_WHEN_NOTEWORTHY && !noteworthy) return;
+/**
+ * Runs no longer email. Each run appends its results here and the
+ * sendNightlyDigest trigger emails ONE summary at DIGEST_HOUR.
+ */
+function digestQueue() {
+  var raw = PropertiesService.getScriptProperties().getProperty('DIGEST_QUEUE');
+  try {
+    if (raw) return JSON.parse(raw);
+  } catch (e) {}
+  return { runs: 0, statements: 0, invoices: 0, skipped: 0, seen: 0, review: 0,
+           filed: [], hubdoc: [], newSuppliers: [], problems: [] };
+}
 
-  var lines = [];
+/** Keep the queue property well under the 9KB cap on busy days. */
+function capList(list, max) {
+  if (list.length <= max) return list;
+  var dropped = list.length - max;
+  list = list.slice(0, max);
+  list.push('...and ' + dropped + ' more');
+  return list;
+}
 
-  if (report.filed.length) {
-    lines.push('FILED TO DROPBOX (' + report.filed.length + ')');
-    report.filed.forEach(function (p) { lines.push('  ' + p); });
-    lines.push('');
-  }
+function queueDigest(stats, report) {
+  var q = digestQueue();
+  q.runs++;
+  q.statements += stats.statements;
+  q.invoices += stats.invoices;
+  q.skipped += stats.skipped;
+  q.seen += stats.seen;
+  q.review += stats.review;
+  q.filed = capList(q.filed.concat(report.filed), 120);
+  q.hubdoc = capList(q.hubdoc.concat(report.hubdoc), 120);
+  q.newSuppliers = capList(q.newSuppliers.concat(report.newSuppliers), 40);
+  q.problems = capList(q.problems.concat(report.problems), 60);
+  PropertiesService.getScriptProperties()
+    .setProperty('DIGEST_QUEUE', JSON.stringify(q));
+}
 
-  if (report.hubdoc.length) {
-    lines.push('SENT TO HUBDOC (' + report.hubdoc.length + ')');
-    report.hubdoc.forEach(function (x) { lines.push('  ' + x); });
-    lines.push('');
-  }
-
-  if (report.newSuppliers.length) {
-    lines.push('NEW SUPPLIERS LEARNED (' + report.newSuppliers.length + ')');
-    lines.push('These now get checked automatically. Nothing for you to do,');
-    lines.push('but if any looks wrong, run forgetSupplier in the editor.');
-    report.newSuppliers.forEach(function (x) { lines.push('  ' + x); });
-    lines.push('');
-  }
-
-  if (stats.review) {
-    lines.push('NEEDS A LOOK (' + stats.review + ')');
-    lines.push('Filed under the Bookkeeping/Needs-review label in Gmail.');
-    lines.push('Usually a scanned or password-protected PDF it could not read.');
-    lines.push('');
-  }
-
-  if (report.problems.length) {
-    lines.push('PROBLEMS (' + report.problems.length + ')');
-    report.problems.slice(0, 15).forEach(function (x) { lines.push('  ' + x); });
-    if (report.problems.length > 15) {
-      lines.push('  ...and ' + (report.problems.length - 15) + ' more');
-    }
-    lines.push('');
-  }
-
-  lines.push('---');
-  lines.push('Statements ' + stats.statements + ' | invoices ' + stats.invoices +
-             ' | skipped free ' + stats.skipped + ' | read ' + stats.seen);
-  if (stats.capped || stats.timedOut) {
-    lines.push('More still to process - another run is already booked.');
-  }
+/** Fired daily at DIGEST_HOUR by its own trigger (installDigestTrigger). */
+function sendNightlyDigest() {
+  // Wait out any in-flight run so a run finishing right now isn't missed;
+  // an hourly run arriving while we hold the lock skips harmlessly.
+  var lock = LockService.getScriptLock();
+  var locked = lock.tryLock(3 * 60 * 1000);
 
   try {
+    var q = digestQueue();
+    var noteworthy = q.filed.length || q.newSuppliers.length ||
+                     q.problems.length || q.review || q.hubdoc.length;
+
+    if (!q.runs || (EMAIL_ONLY_WHEN_NOTEWORTHY && !noteworthy)) {
+      PropertiesService.getScriptProperties().deleteProperty('DIGEST_QUEUE');
+      Logger.log('Quiet day - no digest email sent.');
+      return;
+    }
+
+    var lines = [];
+
+    if (q.filed.length) {
+      lines.push('FILED TO DROPBOX (' + q.filed.length + ')');
+      q.filed.forEach(function (p) { lines.push('  ' + p); });
+      lines.push('');
+    }
+
+    if (q.hubdoc.length) {
+      lines.push('SENT TO HUBDOC (' + q.hubdoc.length + ')');
+      q.hubdoc.forEach(function (x) { lines.push('  ' + x); });
+      lines.push('');
+    }
+
+    if (q.newSuppliers.length) {
+      lines.push('NEW SUPPLIERS LEARNED (' + q.newSuppliers.length + ')');
+      lines.push('These now get checked automatically. Nothing for you to do,');
+      lines.push('but if any looks wrong, run forgetSupplier in the editor.');
+      q.newSuppliers.forEach(function (x) { lines.push('  ' + x); });
+      lines.push('');
+    }
+
+    if (q.review) {
+      lines.push('NEEDS A LOOK (' + q.review + ')');
+      lines.push('Filed under the Bookkeeping/Needs-review label in Gmail.');
+      lines.push('Usually a scanned or password-protected PDF it could not read.');
+      lines.push('');
+    }
+
+    if (q.problems.length) {
+      lines.push('PROBLEMS (' + q.problems.length + ')');
+      q.problems.forEach(function (x) { lines.push('  ' + x); });
+      lines.push('');
+    }
+
+    lines.push('---');
+    lines.push('Today: ' + q.runs + ' run(s) | statements ' + q.statements +
+               ' | invoices ' + q.invoices + ' | skipped free ' + q.skipped +
+               ' | read ' + q.seen);
+
     MailApp.sendEmail({
       to: ALERT_EMAIL,
-      subject: 'Statement filer: ' + report.filed.length + ' filed, ' +
-               report.hubdoc.length + ' to Hubdoc' +
-               (report.problems.length ? ', ' + report.problems.length + ' problem(s)' : ''),
+      subject: 'Statement filer daily summary: ' + q.filed.length + ' filed, ' +
+               q.hubdoc.length + ' to Hubdoc' +
+               (q.problems.length ? ', ' + q.problems.length + ' problem(s)' : ''),
       body: lines.join('\n')
     });
-    Logger.log('Digest emailed to ' + ALERT_EMAIL);
+    PropertiesService.getScriptProperties().deleteProperty('DIGEST_QUEUE');
+    Logger.log('Daily digest emailed to ' + ALERT_EMAIL);
   } catch (err) {
-    Logger.log('Could not send digest: ' + err);
+    // Keep the queue - tomorrow's digest will include today.
+    Logger.log('Could not send daily digest (kept for tomorrow): ' + err);
+  } finally {
+    if (locked) lock.releaseLock();
   }
+}
+
+/** Run once to install (or move) the 8pm digest trigger. */
+function installDigestTrigger() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'sendNightlyDigest') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('sendNightlyDigest').timeBased()
+    .everyDays(1).atHour(DIGEST_HOUR).inTimezone('Australia/Sydney').create();
+  Logger.log('Nightly digest trigger installed (about ' + DIGEST_HOUR + ':00 Sydney).');
 }
 
 function processMailbox(user, after, before, opts, budget, stats, discovered,
